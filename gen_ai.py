@@ -2,6 +2,8 @@ import chromadb
 from google import genai
 from dotenv import load_dotenv
 import os
+import json
+import re
 
 load_dotenv()
 
@@ -31,13 +33,64 @@ def update_memory(user, ai):
 # Intent Detection
 # -------------------------
 def detect_intent(text):
-    text = text.lower()
+    text = text.lower().strip()
 
-    if any(w in text for w in ["hi", "hello", "hey"]):
+    question_words = ["what", "why", "how", "when", "where"]
+    greeting_words = ["hi", "hello", "hey", "good morning", "good afternoon"]
+
+    is_greeting = any(re.search(rf"\b{word}\b", text) for word in greeting_words)
+
+    is_question = (
+        "?" in text or
+        any(word in text for word in question_words)
+    )
+
+    # mixed intent → LLM
+    if is_greeting and is_question:
+        return detect_intent_llm(text)
+
+    # greeting only
+    if is_greeting:
         return "greeting"
 
-    return "question"
+    # question only
+    if is_question:
+        return "question"
 
+    # fallback
+    return detect_intent_llm(text)
+
+def detect_intent_llm(text):
+    prompt = f"""
+Classify intent into ONLY one:
+greeting, question, unknown
+
+Return ONLY JSON:
+{{"intent":"question"}}
+
+Text:
+{text}
+"""
+
+    try:
+        response = client_ai.models.generate_content(
+            model="gemini-3.1-flash-lite",
+            contents=prompt
+        )
+
+        raw = response.text.strip()
+
+        start = raw.find("{")
+        end = raw.rfind("}") + 1
+
+        if start == -1 or end == 0:
+            return "unknown"
+
+        data = json.loads(raw[start:end])
+        return data.get("intent", "unknown")
+
+    except:
+        return "unknown"
 
 # -------------------------
 # Router
@@ -70,7 +123,7 @@ def retrieve(prompt):
     valid_docs = []
 
     for doc, dist in zip(documents, distances):
-        if dist < 0.8:
+        if dist < 0.75:
             valid_docs.append(doc)
 
     if not valid_docs:
@@ -95,37 +148,44 @@ def chat(prompt):
     context = retrieve(prompt)
 
     if context is None:
-        return "Sorry, I don't have enough information in my knowledge base."
+        context = "No relevant knowledge found. Answer generally."
 
     memory = ""
 
-    for h in history:
-        memory += f"User: {h['user']}\nAI: {h['ai']}\n"
+    memory = "\n".join([
+        f"User: {h['user']}\nAI: {h['ai']}"
+        for h in history
+    ])
 
 
     full_prompt = f"""
-You are a plant biology teacher.
+You are a strict plant biology assistant.
 
-Previous Conversation:
-{memory}
+RULES:
+- Use ONLY the KNOWLEDGE provided below.
+- Do NOT use your own knowledge.
+- If the answer is not in KNOWLEDGE, say:
+  "I don't know based on the provided knowledge base."
 
-Knowledge:
+KNOWLEDGE (use only this):
+-------------------------
 {context}
+-------------------------
 
-Question:
+QUESTION:
 {prompt}
 
-Previous Conversation is ONLY for understanding pronouns like "it", "this".
-Do NOT treat it as factual knowledge.
-Answer based on the knowledge.
-
+IMPORTANT:
+- Do not guess.
+- Do not assume.
+- Do not hallucinate.
 """
-
+    print(context)
     response = client_ai.models.generate_content(
         model="gemini-3.1-flash-lite",
         contents=full_prompt
     )
-
+    
     answer = response.text
 
     update_memory(prompt, answer)
